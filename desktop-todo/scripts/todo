@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""给人和 AI 用的待办命令行。服务器地址和密钥从环境变量或配置文件读取。"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+# 退出码（详见 CLI.md）
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_NETWORK = 2
+EXIT_AUTH = 3
+EXIT_NOT_FOUND = 4
+
+CANONICAL_CONFIG = Path.home() / ".config" / "todo" / "config.json"
+LEGACY_CONFIG = Path.home() / ".config" / "todo-widget" / "cli.json"
+
+
+class UsageError(Exception):
+    def __init__(self, message: str, code: int = EXIT_USAGE):
+        super().__init__(message)
+        self.code = code
+
+
+def die(msg: str, code: int = EXIT_USAGE) -> None:
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def config_path() -> Path:
+    if os.environ.get("TODO_CLI_CONFIG"):
+        return Path(os.environ["TODO_CLI_CONFIG"]).expanduser()
+    return CANONICAL_CONFIG
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def load_cfg() -> dict:
+    cfg: dict = {}
+    if not os.environ.get("TODO_CLI_CONFIG") and LEGACY_CONFIG.exists():
+        cfg.update(_read_json(LEGACY_CONFIG))
+    path = config_path()
+    if path.exists():
+        cfg.update(_read_json(path))
+    return cfg
+
+
+def save_cfg(update: dict) -> dict:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cfg = _read_json(path) if path.exists() else {}
+    cfg.update(update)
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return cfg
+
+
+def api_url() -> str:
+    cfg = load_cfg()
+    url = (
+        os.environ.get("TODO_API_URL")
+        or cfg.get("url")
+        or cfg.get("TODO_API_URL")
+        or cfg.get("api_url")
+    )
+    if not url:
+        die(
+            "还没有配置服务器地址。请设置环境变量 TODO_API_URL，或在配置文件里写 url。",
+            EXIT_USAGE,
+        )
+    return str(url).rstrip("/")
+
+
+def auth_token() -> str:
+    cfg = load_cfg()
+    return (
+        os.environ.get("TODO_API_KEY")
+        or os.environ.get("TODO_API_TOKEN")
+        or cfg.get("api_key")
+        or cfg.get("TODO_API_KEY")
+        or cfg.get("token")
+        or ""
+    )
+
+
+def want_json(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "json", False) or os.environ.get("TODO_JSON") == "1")
+
+
+def emit(args: argparse.Namespace, human: str, payload: dict) -> None:
+    if want_json(args):
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    elif human:
+        sys.stdout.write(human if human.endswith("\n") else human + "\n")
+
+
+def request(method: str, path: str, body: dict | None = None, token: str | None = None, auth: bool = True) -> Any:
+    tok = auth_token() if token is None else token
+    if auth and not tok:
+        die("还没有登录。请先运行：todo login <用户名>\n或设置环境变量 TODO_API_KEY，或在 ~/.config/todo/config.json 里写 api_key。", EXIT_AUTH)
+    url = api_url() + path
+    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method)
+    if auth and tok:
+        req.add_header("Authorization", "Bearer " + tok)
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json; charset=utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            err = json.loads(raw).get("error") or raw
+        except json.JSONDecodeError:
+            err = raw or str(exc)
+        if exc.code in (401, 403):
+            die(f"HTTP {exc.code}: {err}", EXIT_AUTH)
+        if exc.code == 404:
+            die(f"HTTP {exc.code}: {err}", EXIT_NOT_FOUND)
+        die(f"HTTP {exc.code}: {err}", EXIT_NETWORK)
+    except urllib.error.URLError as exc:
+        die(f"连不上服务 {url}：{exc.reason}", EXIT_NETWORK)
+
+
+def ask_password(prompt: str = "密码：") -> str:
+    if not sys.stdin.isatty():
+        die("请用 --password 传入密码，或在终端里交互输入", EXIT_USAGE)
+    return getpass.getpass(prompt)
+
+
+def print_item(item: dict) -> str:
+    mark = "✓" if item.get("done") else "·"
+    due = item.get("due") or "—"
+    flag = " 过期" if item.get("overdue") else ""
+    group = item.get("group") or ""
+    return f"{mark} {item['id'][:8]}  [{group}]  {due}{flag}  {item.get('text')}"
+
+
+def cmd_register(args: argparse.Namespace) -> None:
+    password = args.password or ask_password("密码：")
+    if args.password is None:
+        confirm = ask_password("再输入一次：")
+        if password != confirm:
+            die("两次密码不一样", EXIT_USAGE)
+    data = request("POST", "/api/register", {"username": args.username, "password": password}, auth=False)
+    save_cfg({"url": api_url(), "token": data["token"], "username": data["user"]["username"]})
+    extra = ""
+    if data.get("migratedTodos"):
+        extra = f"，并迁入了 {data['migratedTodos']} 条原来的待办"
+    emit(args, f"已注册并登录为 {data['user']['username']}{extra}", {"ok": True, "user": data["user"], "migratedTodos": data.get("migratedTodos", 0)})
+
+
+def cmd_login(args: argparse.Namespace) -> None:
+    password = args.password or ask_password()
+    data = request("POST", "/api/login", {"username": args.username, "password": password}, auth=False)
+    save_cfg({"url": api_url(), "token": data["token"], "username": data["user"]["username"]})
+    emit(args, f"已登录为 {data['user']['username']}", {"ok": True, "user": data["user"]})
+
+
+def cmd_logout(args: argparse.Namespace) -> None:
+    tok = auth_token()
+    if tok:
+        try:
+            request("POST", "/api/logout", {}, token=tok)
+        except SystemExit:
+            pass
+    save_cfg({"token": "", "api_key": ""})
+    emit(args, "已退出登录", {"ok": True})
+
+
+def cmd_whoami(args: argparse.Namespace) -> None:
+    data = request("GET", "/api/me")
+    user = data.get("user") or {}
+    human = f"{user.get('username')}  ({user.get('id') or ''})\n注册通道：" + ("开放" if data.get("registrationOpen") else "已关闭")
+    emit(args, human, {"ok": True, "user": user, "registrationOpen": bool(data.get("registrationOpen"))})
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    data = request("GET", "/api/todos")
+    todos = data.get("todos") or []
+    if want_json(args):
+        emit(args, "", {"ok": True, "today": data.get("today"), "todos": todos})
+        return
+    if not todos:
+        print("（还没有待办）")
+        return
+    current = None
+    lines = []
+    for item in todos:
+        if item.get("group") != current:
+            current = item.get("group")
+            lines.append(f"\n{current}")
+        lines.append(print_item(item))
+    print("\n".join(lines) + "\n")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    body: dict[str, Any] = {"text": args.text, "source": args.source}
+    if args.due:
+        body["due"] = args.due
+    item = request("POST", "/api/todos", body)["todo"]
+    emit(args, "已添加：\n" + print_item(item), {"ok": True, "todo": item})
+
+
+def cmd_done(args: argparse.Namespace) -> None:
+    item = request("PATCH", f"/api/todos/{args.id}", {"done": True})["todo"]
+    emit(args, "已勾完：\n" + print_item(item), {"ok": True, "todo": item})
+
+
+def cmd_undone(args: argparse.Namespace) -> None:
+    item = request("PATCH", f"/api/todos/{args.id}", {"done": False})["todo"]
+    emit(args, "已取消勾选：\n" + print_item(item), {"ok": True, "todo": item})
+
+
+def cmd_edit(args: argparse.Namespace) -> None:
+    body: dict[str, Any] = {}
+    if args.text:
+        body["text"] = args.text
+    if args.due is not None:
+        body["due"] = args.due
+    if not body:
+        die("请至少提供 --text 或 --due", EXIT_USAGE)
+    item = request("PATCH", f"/api/todos/{args.id}", body)["todo"]
+    emit(args, "已更新：\n" + print_item(item), {"ok": True, "todo": item})
+
+
+def cmd_delete(args: argparse.Namespace) -> None:
+    request("DELETE", f"/api/todos/{args.id}")
+    emit(args, f"已删除 {args.id}", {"ok": True, "id": args.id})
+
+
+def cmd_apikey(args: argparse.Namespace) -> None:
+    if args.action == "create":
+        data = request("POST", "/api/apikeys", {"name": args.name or "ai"})
+        key = data["apikey"]
+        if args.save:
+            save_cfg({"api_key": key["key"], "url": api_url()})
+        human = "请把这串密钥存好，之后不会再显示完整内容：\n" + key["key"] + f"\n名称 {key['name']}  id {key['id']}"
+        if args.save:
+            human += f"\n已写入 {config_path()}"
+        emit(args, human, {"ok": True, "apikey": key})
+        return
+    if args.action == "list":
+        keys = request("GET", "/api/apikeys").get("apikeys") or []
+        if want_json(args):
+            emit(args, "", {"ok": True, "apikeys": keys})
+            return
+        if not keys:
+            print("（还没有 API 密钥）")
+            return
+        for k in keys:
+            print(f"{k['id'][:8]}  {k.get('name')}  {k.get('prefix')}  {k.get('created_at')}")
+        return
+    if args.action == "show":
+        key = request("GET", "/api/apikeys/ai").get("apikey")
+        if not key:
+            die("还没有 AI 密钥。生成一把：todo apikey regenerate", EXIT_NOTFOUND)
+        if key.get("key"):
+            if args.save:
+                save_cfg({"api_key": key["key"], "url": api_url()})
+            human = key["key"]
+            if args.save:
+                human += f"\n已写入 {config_path()}"
+        else:
+            human = f"找到密钥（{key.get('prefix')}），但完整内容是旧格式，服务器没有保存。请运行：todo apikey regenerate"
+        emit(args, human, {"ok": True, "apikey": key})
+        return
+    if args.action == "regenerate":
+        key = request("POST", "/api/apikeys/ai/regenerate", {}).get("apikey")
+        if args.save:
+            save_cfg({"api_key": key["key"], "url": api_url()})
+        human = "旧的 AI 密钥已作废。新密钥：\n" + key["key"]
+        if args.save:
+            human += f"\n已写入 {config_path()}"
+        emit(args, human, {"ok": True, "apikey": key})
+        return
+    if args.action == "delete":
+        if not args.id:
+            die("请提供要删除的密钥 id", EXIT_USAGE)
+        kid = resolve_apikey_id(args.id)
+        request("DELETE", f"/api/apikeys/{kid}")
+        emit(args, "已删除密钥", {"ok": True, "id": kid})
+        return
+    die("未知的 apikey 操作", EXIT_USAGE)
+
+
+def resolve_apikey_id(kid: str) -> str:
+    if len(kid) >= 32:
+        return kid
+    keys = request("GET", "/api/apikeys").get("apikeys") or []
+    matches = [k for k in keys if k["id"].startswith(kid)]
+    if len(matches) == 1:
+        return matches[0]["id"]
+    if not matches:
+        die(f"找不到以 {kid} 开头的密钥", EXIT_NOT_FOUND)
+    die("有多条匹配，请把 id 写完整：\n" + "\n".join(f"  {k['id']}  {k.get('name')}" for k in matches), EXIT_USAGE)
+
+
+def resolve_id(tid: str) -> str:
+    if len(tid) >= 32:
+        return tid
+    data = request("GET", "/api/todos")
+    matches = [t for t in data.get("todos") or [] if t["id"].startswith(tid)]
+    if len(matches) == 1:
+        return matches[0]["id"]
+    if not matches:
+        die(f"找不到以 {tid} 开头的待办", EXIT_NOT_FOUND)
+    die("有多条匹配，请把 id 写完整：\n" + "\n".join(f"  {t['id']}  {t['text']}" for t in matches), EXIT_USAGE)
+
+
+class TodoParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        die(message, EXIT_USAGE)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument("--json", action="store_true", help="在 stdout 打印 JSON，方便程序或 AI 解析")
+
+    p = TodoParser(
+        prog="todo",
+        description="个人待办命令行。人和 AI 都可以用。需配置 TODO_API_URL 与 TODO_API_KEY。",
+        parents=[shared],
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("register", help="注册并登录", parents=[shared])
+    r.add_argument("username")
+    r.add_argument("--password")
+
+    lg = sub.add_parser("login", help="登录并保存会话", parents=[shared])
+    lg.add_argument("username")
+    lg.add_argument("--password")
+
+    sub.add_parser("logout", help="退出登录", parents=[shared])
+    sub.add_parser("whoami", help="查看当前用户", parents=[shared])
+
+    sub.add_parser("list", help="列出待办", parents=[shared])
+
+    a = sub.add_parser("add", help="添加一条待办", parents=[shared])
+    a.add_argument("text")
+    a.add_argument("--due", help="today / tomorrow / YYYY-MM-DD，也可用 今天 / 明天 / 以后")
+    a.add_argument("--source", choices=("ai", "manual"), default="ai")
+
+    d = sub.add_parser("done", help="勾完一条", parents=[shared])
+    d.add_argument("id", help="完整 id 或唯一前缀")
+
+    u = sub.add_parser("undone", help="取消勾选", parents=[shared])
+    u.add_argument("id", help="完整 id 或唯一前缀")
+
+    e = sub.add_parser("edit", help="改文字或日期", aliases=["update"], parents=[shared])
+    e.add_argument("id", help="完整 id 或唯一前缀")
+    e.add_argument("--text")
+    e.add_argument("--due", help="today / tomorrow / YYYY-MM-DD / 以后")
+
+    x = sub.add_parser("delete", help="删除一条", aliases=["rm"], parents=[shared])
+    x.add_argument("id", help="完整 id 或唯一前缀")
+
+    k = sub.add_parser("apikey", help="管理 API 密钥", parents=[shared])
+    k.add_argument("action", choices=("create", "list", "show", "regenerate", "delete"))
+    k.add_argument("id", nargs="?", help="delete 时的密钥 id，可用前缀")
+    k.add_argument("--name", default="ai")
+    k.add_argument("--save", action="store_true", help="create 后把密钥写入 ~/.config/todo/config.json")
+    return p
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.cmd in ("done", "undone", "edit", "update", "delete", "rm"):
+        args.id = resolve_id(args.id)
+    commands = {
+        "register": cmd_register,
+        "login": cmd_login,
+        "logout": cmd_logout,
+        "whoami": cmd_whoami,
+        "list": cmd_list,
+        "add": cmd_add,
+        "done": cmd_done,
+        "undone": cmd_undone,
+        "edit": cmd_edit,
+        "update": cmd_edit,
+        "delete": cmd_delete,
+        "rm": cmd_delete,
+        "apikey": cmd_apikey,
+    }
+    commands[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
